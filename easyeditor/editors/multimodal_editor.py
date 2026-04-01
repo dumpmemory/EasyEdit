@@ -206,6 +206,29 @@ class MultimodalEditor:
 
         # sequential editing
         if sequential_edit:
+            # Cache pre-edit results BEFORE the editing loop, since copy=False
+            # modifies self.model in-place, making it identical to edited_model.
+            # Without caching, locality would compare the edited model against
+            # itself instead of the original model. (See issue #643)
+            pre_edit_cache = []
+            for i, request in enumerate(tqdm(requests, total=len(requests), desc='Computing pre-edit metrics')):
+                if self.alg_name == 'IKE':
+                    if self.hparams.k != 0:
+                        pre_result = compute_icl_multimodal_edit_quality(self.model, self.model_name, self.hparams, self.tok, [''],
+                                                                request, self.hparams.device, pre_edit=True)
+                    else:
+                        pre_result = compute_multimodal_hf_edit_results(self.model, self.model_name, self.hparams, self.tok,
+                                                                request, self.hparams.device)
+                else:
+                    if self.model_name in ['minigpt4', 'blip2']:
+                        pre_result = compute_multimodal_edit_results(self.model, self.model_name, self.hparams, self.tok,
+                                                                request, self.hparams.device)
+                    elif self.model_name in ['llava-onevision', 'qwen2-vl']:
+                        pre_result = compute_multimodal_hf_edit_results(self.model, self.model_name, self.hparams, self.tok,
+                                                                request, self.hparams.device)
+                pre_edit_cache.append(pre_result)
+
+            start = time()
             for i, request in enumerate(tqdm(requests, total=len(requests))):
                 if self.alg_name == 'IKE' and self.hparams.k == 0:
                     edited_model = self.model
@@ -225,23 +248,19 @@ class MultimodalEditor:
             if self.alg_name == 'WISE' and hasattr(self.hparams, 'save_path') and self.hparams.save_path:
                 print("Start saving the WISE model!")
                 edited_model.save(self.hparams.save_path)
-                
+
             all_metrics = []
-            exec_time = time() - start
-            for i, request in enumerate(tqdm(requests, total=len(requests))):
+            for i, request in enumerate(tqdm(requests, total=len(requests), desc='Evaluating post-edit metrics')):
                 if self.alg_name == 'IKE':
-                    if self.hparams.k != 0:    
+                    if self.hparams.k != 0:
                         metrics = {
                             'case_nums': i,
                             "time": exec_time,
                             "post": compute_icl_multimodal_edit_quality(self.model, self.model_name, self.hparams, self.tok, icl_examples,
                                                                 request, self.hparams.device),
-                            "pre": compute_icl_multimodal_edit_quality(self.model, self.model_name, self.hparams, self.tok, [''],
-                                                                request, self.hparams.device, pre_edit=True)
+                            "pre": pre_edit_cache[i]
                         }
                     else:
-                        # QUESTION = request["prompt"]
-                        # ANSWER = request["target"]
                         from copy import deepcopy
                         prompt_new_request = deepcopy(request)
                         prefix_template = self.hparams.template.format(prompt=request["prompt"],target=request["target"])
@@ -254,8 +273,7 @@ class MultimodalEditor:
                             "time": exec_time,
                             "post": compute_multimodal_hf_edit_results(self.model, self.model_name, self.hparams, self.tok,
                                                                 prompt_new_request, self.hparams.device),
-                            "pre": compute_multimodal_hf_edit_results(self.model, self.model_name, self.hparams, self.tok,
-                                                                request, self.hparams.device)
+                            "pre": pre_edit_cache[i]
                         }
                 else:
                     if self.model_name in ['minigpt4', 'blip2']:
@@ -264,8 +282,7 @@ class MultimodalEditor:
                             "time": exec_time,
                             "post": compute_multimodal_edit_results(edited_model, self.model_name, self.hparams, self.tok,
                                                                 request, self.hparams.device),
-                            "pre": compute_multimodal_edit_results(self.model, self.model_name, self.hparams, self.tok,
-                                                                request, self.hparams.device)
+                            "pre": pre_edit_cache[i]
                         }
                     elif self.model_name in ['llava-onevision', 'qwen2-vl']:
                         metrics = {
@@ -273,8 +290,7 @@ class MultimodalEditor:
                             "time": exec_time,
                             "post": compute_multimodal_hf_edit_results(edited_model, self.model_name, self.hparams, self.tok,
                                                                 request, self.hparams.device),
-                            "pre": compute_multimodal_hf_edit_results(self.model, self.model_name, self.hparams, self.tok,
-                                                                request, self.hparams.device)
+                            "pre": pre_edit_cache[i]
                         }
                                 
                 if 'locality_output' in metrics['post'].keys():
