@@ -501,43 +501,6 @@ class BaseModelWrapper:
             if 'intervention_dict' in layer_state:
                 model_layers[i].intervention_dict = layer_state['intervention_dict']
 
-    @staticmethod
-    def _copy_activation_value(value):
-        if isinstance(value, t.Tensor):
-            return value.clone().detach()
-        try:
-            return copy.deepcopy(value)
-        except Exception:
-            return value
-
-    def _save_and_clear_generation_state(self, model_layers):
-        saved_layer_state = {}
-
-        for i, layer in enumerate(model_layers):
-            layer_state = {}
-            if hasattr(layer, 'add_activations_dict') and layer.add_activations_dict:
-                layer_state['add_activations_dict'] = {
-                    key: self._copy_activation_value(value)
-                    for key, value in layer.add_activations_dict.items()
-                }
-                layer.add_activations_dict = {}
-
-            if hasattr(layer, 'intervention_dict') and layer.intervention_dict:
-                layer_state['intervention_dict'] = dict(layer.intervention_dict)
-                layer.intervention_dict = {}
-
-            if layer_state:
-                saved_layer_state[i] = layer_state
-
-        return saved_layer_state
-
-    def _restore_generation_state(self, model_layers, saved_layer_state):
-        for i, layer_state in saved_layer_state.items():
-            if 'add_activations_dict' in layer_state:
-                model_layers[i].add_activations_dict = layer_state['add_activations_dict']
-            if 'intervention_dict' in layer_state:
-                model_layers[i].intervention_dict = layer_state['intervention_dict']
-
     def _lm_head(self):
         """The output projection. Override if a subclass nests it elsewhere."""
         return self.model.lm_head
@@ -686,7 +649,6 @@ class BaseModelWrapper:
     def ori_generate(self, input_ids, **kwargs):
         model_layers = self._decoder_layers()
         saved_layer_state = self._save_and_clear_generation_state(model_layers)
-        saved_layer_state = self._save_and_clear_generation_state(model_layers)
         
         # Save steer value if exists
         saved_steer_values = t.zeros(1)
@@ -701,7 +663,6 @@ class BaseModelWrapper:
                 **kwargs
             )
         finally:
-            self._restore_generation_state(model_layers, saved_layer_state)
             self._restore_generation_state(model_layers, saved_layer_state)
             
             # Restore steer value
@@ -955,9 +916,18 @@ class GPTWrapper(BaseModelWrapper):
             raise ValueError(f"Method {method_name} not supported to reset")
     
     def ori_generate(self, input_ids, **kwargs):
-        model_layers = self._decoder_layers()
-        saved_layer_state = self._save_and_clear_generation_state(model_layers)
+        # Save activation dictionaries
+        saved_activations = {}
+        if hasattr(self.model, 'transformer') and isinstance(self.model.transformer, Hack_no_grad):
+            model_layers = self.model.transformer.module.h
+        else:
+            model_layers = self.model.transformer.h
             
+        for i, layer in enumerate(model_layers):
+            if hasattr(layer, 'add_activations_dict') and layer.add_activations_dict:
+                saved_activations[i] = copy.deepcopy(layer.add_activations_dict)
+                layer.add_activations_dict = {}
+        
         # Save steer value if exists
         saved_steer_value = 0
         if hasattr(self, 'steer') and hasattr(self.steer, 'steer_value'):
@@ -971,8 +941,9 @@ class GPTWrapper(BaseModelWrapper):
                 **kwargs
             )
         finally:
-            self._restore_generation_state(model_layers, saved_layer_state)
-            self._restore_generation_state(model_layers, saved_layer_state)
+            # Restore activation dictionaries
+            for i, activations_dict in saved_activations.items():
+                model_layers[i].add_activations_dict = activations_dict
             
             # Restore steer value
             if saved_steer_value is not None and hasattr(self, 'steer'):
