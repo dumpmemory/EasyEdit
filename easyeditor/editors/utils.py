@@ -10,7 +10,7 @@ from ..util import nethook
 from ..util.device import copy_to_param
 
 
-CALLABLE_RESTORE_ALGS = {"KN", "GRACE", "WISE"}
+CALLABLE_RESTORE_ALGS = {"KN", "GRACE", "WISE", "DEFER"}
 PEFT_RESTORE_ALGS = {"LoRA", "QLoRA", "DPO"}
 KEEP_EDITED_MODEL_ALGS = {"MELO"}
 

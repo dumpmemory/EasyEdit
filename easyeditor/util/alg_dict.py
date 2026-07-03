@@ -17,6 +17,7 @@ from ..models.melo import MELOHyperParams, apply_melo_to_model
 from ..models.wise import WISEHyperParams, apply_wise_to_model, apply_wise_to_multimodal_model
 from ..models.r_rome import R_ROMEHyperParams, apply_r_rome_to_model
 from ..models.emmet import EMMETHyperParams, apply_emmet_to_model
+from ..models.eamet import EAMETHyperParams, apply_eamet_to_model
 from ..models.alphaedit import AlphaEditHyperParams, apply_AlphaEdit_to_model
 from ..models.SPHERE import SPHEREHyperParams, apply_SPHERE_to_model
 from ..models.core import COREHyperParams, apply_core_to_model
@@ -24,6 +25,7 @@ from .. models.deepedit_api import DeepEditApiHyperParams, apply_deepedit_api_to
 from ..models.dpo import DPOHyperParams, apply_dpo_to_model
 from ..models.ultraedit import UltraEditHyperParams, UltraEditRewriteExecutor
 from ..models.simie import SimIEHyperParams, apply_simie_to_model
+from ..models.defer import DeferHyperParams, apply_defer_to_model
 
 
 ALG_DICT = {
@@ -46,14 +48,29 @@ ALG_DICT = {
     'WISE': apply_wise_to_model,
     'R-ROME': apply_r_rome_to_model,
     "EMMET": apply_emmet_to_model,
+    "EAMET": apply_eamet_to_model,
     "AlphaEdit": apply_AlphaEdit_to_model,
     "SPHERE": apply_SPHERE_to_model,
     "ULTRAEDIT": UltraEditRewriteExecutor().apply_to_model,
     "CORE": apply_core_to_model,
     "DeepEdit-Api": apply_deepedit_api_to_model,
-    "SimIE": apply_simie_to_model
+    "SimIE": apply_simie_to_model,
+    "DEFER": apply_defer_to_model
 }
 
+MULTIMODAL_EDIT_ALGS = {
+    'MEND',
+    'SERAC',
+    'SERAC_MULTI',
+    'IKE',
+    'LoRA',
+    'WISE',
+    'GRACE',
+}
+
+# Multimodal edit entry points. This is intentionally broader than the
+# multimodal training registry in alg_train_dict.py: several methods support
+# applying edits/evaluation only, but do not expose a trainer implementation.
 ALG_MULTIMODAL_DICT = {
     'MEND': MendMultimodalRewriteExecutor().apply_to_model,
     'SERAC': SeracMultimodalRewriteExecutor().apply_to_model,
