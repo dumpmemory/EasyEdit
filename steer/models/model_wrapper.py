@@ -12,9 +12,6 @@ from steer.vector_generators.lm_steer.generate_lm_steer_hparam import LmSteerHyp
 from steer.utils.hparams import HyperParams
 from steer.vector_generators.lm_steer.lm_steer_helper import Hack_no_grad, Projected_Adaptor
 
-# New vLLM will implicitly enable multiprocessing for speed, but steering requires in-process execution.
-os.environ.setdefault('VLLM_ENABLE_V1_MULTIPROCESSING', '0')
-
 try:
     from vllm import LLM
     VLLM_AVAILABLE = True
@@ -246,9 +243,7 @@ class BlockOutputWrapper(t.nn.Module):
                             kwargs['args'] = args[0]
                             assert kwargs['args'] is not None, "Block input activations are None"
                     # call the forward method of the intervention class
-                    intervention_result = intervention.forward(
-                        augmented_output, from_pos=self.from_position, **kwargs
-                    )
+                    intervention_result = intervention.forward(augmented_output, **kwargs)
                     # handle different types of return values
                     if hasattr(intervention_result, 'output'):
                         # for the case that the intervention class returns InterventionOutput
@@ -301,11 +296,16 @@ class BlockOutputWrapper(t.nn.Module):
         if method_name == "all":
             self.add_activations_dict.clear()
             self.intervention_dict.clear()
-        else:
-            if method_name in self.add_activations_dict:
-                del self.add_activations_dict[method_name]
+        elif method_name == "reps" or method_name == "sft" or method_name == "spilt":
+            # RePS uses the new intervention class
             if method_name in self.intervention_dict:
                 del self.intervention_dict[method_name]
+            if method_name in self.add_activations_dict:
+                del self.add_activations_dict[method_name]
+        else:
+
+            if method_name in self.add_activations_dict:
+                del self.add_activations_dict[method_name]
         
         self.activations = None
         # self.block.self_attn.activations = None
@@ -343,15 +343,17 @@ class BaseModelWrapper:
         self.processor = None  # text models have no image processor; multimodal subclasses set this
 
         if hparams.vllm_enable and VLLM_AVAILABLE:
-            # Force in-process execution so the layer wrappers we install below actually run
-            # during generation (see the module-level note next to VLLM_ENABLE_V1_MULTIPROCESSING).
-            os.environ['VLLM_ENABLE_V1_MULTIPROCESSING'] = '0'
+            vllm_multiprocessing = getattr(hparams, 'vllm_enable_v1_multiprocessing', True)
+            if hasattr(hparams, 'vllm_enable_v1_multiprocessing'):
+                os.environ['VLLM_ENABLE_V1_MULTIPROCESSING'] = (
+                    '1' if vllm_multiprocessing else '0'
+                )
             llm_kwargs = dict(
                 model=self.model_name_or_path,
-                # enforce_eager=True disables CUDA-graph capture. This is required: steering
-                # mutates per-layer state between calls, which a captured graph would not pick up.
-                enforce_eager=True,
-                tensor_parallel_size=1,
+                # Runtime hooks mutate per-layer state, so eager execution remains the safe default.
+                enforce_eager=getattr(hparams, 'vllm_enforce_eager', True),
+                tensor_parallel_size=getattr(hparams, 'vllm_tensor_parallel_size', 1),
+                pipeline_parallel_size=getattr(hparams, 'vllm_pipeline_parallel_size', 1),
                 dtype=self.dtype,
                 gpu_memory_utilization=getattr(hparams, 'vllm_gpu_memory_utilization', 0.9),
             )
@@ -360,7 +362,7 @@ class BaseModelWrapper:
                 llm_kwargs['max_model_len'] = _max_len
             self.VLLM_model = LLM(**llm_kwargs)
             self.tokenizer = self.VLLM_model.get_tokenizer()
-            self.model = self.extract_vllm_model()
+            self.model = None if vllm_multiprocessing else self.extract_vllm_model()
         else:
             self.VLLM_model = None
             self.tokenizer = AutoTokenizer.from_pretrained(
@@ -378,7 +380,8 @@ class BaseModelWrapper:
             )
 
         ### Customize layers and outputs for specific models
-        self._adapt_model_layers()
+        if self.model is not None:
+            self._adapt_model_layers()
 
     def _load_hf_model(self):
         return AutoModelForCausalLM.from_pretrained(
@@ -533,6 +536,17 @@ class BaseModelWrapper:
         return self._decoder_layers()[layer].dot_products
 
     def reset_all(self):
+        if self.VLLM_model is not None and self.model is None:
+            try:
+                from steer.vector_appliers.vllm_activation_utils import clear_all_vllm_activation_hooks
+                clear_all_vllm_activation_hooks(self)
+            except Exception as exc:
+                print(f"[vLLM] failed to clear worker activation hooks: {exc}")
+            if hasattr(self, 'prompt'):
+                delattr(self, 'prompt')
+            if hasattr(self, 'generate_prompts'):
+                delattr(self, 'generate_prompts')
+            return
         for layer in self._decoder_layers():
             layer.reset(method_name="all")
         if hasattr(self, 'prompt'):
@@ -542,6 +556,8 @@ class BaseModelWrapper:
         self.reset_lm_steer()
             
     def reset_lm_steer(self):
+        if self.model is None:
+            return
         if hasattr(self, 'steer'):
             original_lm_head = self.steer.lm_head
             self.model.set_output_embeddings(original_lm_head)
@@ -554,6 +570,13 @@ class BaseModelWrapper:
     def reset(self, method_name):
         method_name = method_name.lower()
         if method_name in ['caa', 'vector_prompt','sae_feature','sta', 'reps', 'sft', 'spilt']:
+            if self.VLLM_model is not None and self.model is None:
+                try:
+                    from steer.vector_appliers.vllm_activation_utils import reset_vllm_activation_layers
+                    reset_vllm_activation_layers(self, method_name, None)
+                except Exception as exc:
+                    print(f"[vLLM] failed to reset worker activation hooks for {method_name}: {exc}")
+                return
             for layer in self._decoder_layers():
                 layer.reset(method_name=method_name)
         elif method_name in ['lm_steer']:
@@ -632,7 +655,8 @@ class BaseModelWrapper:
     def ori_vllm_generate(self, input_batch, vllm_sampling_params):
         # Save activation dictionaries
         saved_activations = {}
-        model_layers = self._decoder_layers()
+        model_layers = [] if self.model is None else self._decoder_layers()
+        saved_vllm_hooks = {}
 
         for i, layer in enumerate(model_layers):
             if hasattr(layer, 'add_activations_dict') and layer.add_activations_dict:
@@ -648,6 +672,12 @@ class BaseModelWrapper:
                 
                 saved_activations[i] = saved_dict
                 layer.add_activations_dict = {}
+        if self.VLLM_model is not None:
+            try:
+                from steer.vector_appliers.vllm_activation_utils import clear_all_vllm_activation_hooks
+                saved_vllm_hooks = clear_all_vllm_activation_hooks(self)
+            except Exception as exc:
+                print(f"[vLLM] failed to clear worker activation hooks for original generation: {exc}")
         
         # Save steer value if exists
         saved_steer_values = t.zeros(1)
@@ -666,6 +696,12 @@ class BaseModelWrapper:
             # Restore activation dictionaries
             for i, activations_dict in saved_activations.items():
                 model_layers[i].add_activations_dict = activations_dict
+            if saved_vllm_hooks:
+                try:
+                    from steer.vector_appliers.vllm_activation_utils import restore_vllm_activation_hooks
+                    restore_vllm_activation_hooks(self, saved_vllm_hooks)
+                except Exception as exc:
+                    print(f"[vLLM] failed to restore worker activation hooks after original generation: {exc}")
             
             # Restore steer value
             if saved_steer_values is not None and hasattr(self, 'steer'):

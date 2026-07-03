@@ -1,8 +1,12 @@
 import os
 import torch
 from .apply_caa_hparam import ApplyCAAHyperParams
+from ..vllm_activation_utils import reset_vllm_activation_layers, set_vllm_add_activations, uses_vllm
          
 def reset_caa_layers(model, layers):
+    if uses_vllm(model):
+        reset_vllm_activation_layers(model, "caa", layers)
+        return
     # We replace hardcoded hack_no_grad layer with a more flexible detection of the decoder layers, which is more robust to model and vLLM version changes.
     # All reset_*_layers() are now the same implementation with detection. 
     decoder_layers = model._decoder_layers()
@@ -22,6 +26,7 @@ def apply_caa(hparams: ApplyCAAHyperParams,pipline=None, vector=None):
     
     layers = hparams.layers
     multipliers = hparams.multipliers
+    vllm_layer_vectors = {}
     for layer, multiplier in zip(layers, multipliers):
         # print(f"Layer {layer}")
 
@@ -36,14 +41,15 @@ def apply_caa(hparams: ApplyCAAHyperParams,pipline=None, vector=None):
             print("Steering vector path: ",vector_path)
         # print(f"Multiplier {multiplier}")
 
-        from ...models.interventions import ActivationAddition
-
-        intervention = ActivationAddition(
-            steering_vector=steering_vector,
-            multiplier=multiplier,
-        )
-        intervention = intervention.to(device)
-        model.set_intervention(layer, intervention, "caa")
+        add_vector = multiplier * steering_vector
+        if uses_vllm(model):
+            vllm_layer_vectors[layer] = add_vector
+        else:
+            model.set_add_activations(
+                layer, add_vector, method_name="caa"
+            )
+    if uses_vllm(model):
+        set_vllm_add_activations(model, "caa", vllm_layer_vectors)
     return model
 
 # def eval_caa(hparams: ApplyCAAHyperParams):

@@ -1,8 +1,12 @@
 import os
 import torch
 from .apply_merge_vector_hparam import ApplyMergeVectorHyperParams
+from ..vllm_activation_utils import reset_vllm_activation_layers, set_vllm_add_activations, uses_vllm
 
 def reset_merge_vector_layers(model, layers):
+    if uses_vllm(model):
+        reset_vllm_activation_layers(model, "merge_vector", layers)
+        return
     decoder_layers = model._decoder_layers()
     for layer in layers:
         decoder_layers[layer].reset(method_name="merge_vector")
@@ -20,6 +24,7 @@ def apply_merge_vector(hparams: ApplyMergeVectorHyperParams,pipline=None, vector
     
     layers = hparams.layers
     multipliers = hparams.multipliers
+    vllm_layer_vectors = {}
     for layer, multiplier in zip(layers, multipliers):
         print(f"Layer {layer}")
 
@@ -35,14 +40,15 @@ def apply_merge_vector(hparams: ApplyMergeVectorHyperParams,pipline=None, vector
         print("Steering vector: ",steering_vector)
         print(f"Multiplier {multiplier}")
 
-        from ...models.interventions import ActivationAddition
-
-        intervention = ActivationAddition(
-            steering_vector=steering_vector,
-            multiplier=multiplier,
-        )
-        intervention = intervention.to(device)
-        model.set_intervention(layer, intervention, "merge_vector")
+        add_vector = multiplier * steering_vector
+        if uses_vllm(model):
+            vllm_layer_vectors[layer] = add_vector
+        else:
+            model.set_add_activations(
+                layer, add_vector, method_name="merge_vector"
+            )
+    if uses_vllm(model):
+        set_vllm_add_activations(model, "merge_vector", vllm_layer_vectors)
     return model
 
 # def eval_merge_vector(hparams: ApplyMergeVectorHyperParams):
