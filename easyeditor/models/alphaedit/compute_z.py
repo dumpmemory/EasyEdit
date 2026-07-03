@@ -6,6 +6,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from ..rome import repr_tools
 from ...util import nethook
+from ...util.device import get_module_device, normalize_device
 
 from .AlphaEdit_hparams import AlphaEditHyperParams
 
@@ -34,9 +35,12 @@ def compute_z(
         lm_b = next(model.parameters()).new_zeros(model.config.vocab_size)
 
     print("Computing right vector (v)")
+    device = normalize_device(getattr(hparams, "device", None))
+    rewrite_module_name = hparams.layer_module_tmp.format(layer)
+    rewrite_device = get_module_device(nethook.get_module(model, rewrite_module_name), device)
 
     # Tokenize target into list of int token IDs
-    target_ids = tok.encode(request["target_new"], return_tensors="pt", add_special_tokens=False).to(f"cuda:{hparams.device}")[0]
+    target_ids = tok.encode(request["target_new"], return_tensors="pt", add_special_tokens=False).to(device)[0]
 
     if target_ids[0] == tok.bos_token_id or target_ids[0] == tok.unk_token_id:
         target_ids = target_ids[1:]
@@ -52,10 +56,10 @@ def compute_z(
         [prompt.format(request["subject"]) for prompt in all_prompts],
         return_tensors="pt",
         padding=True,
-    ).to(f"cuda:{hparams.device}")
+    ).to(device)
 
     # Compute rewriting targets
-    rewriting_targets = torch.tensor(-100, device=f"cuda:{hparams.device}").repeat(
+    rewriting_targets = torch.tensor(-100, device=device).repeat(
         len(rewriting_prompts), *input_tok["input_ids"].shape[1:]
     )
 
@@ -80,9 +84,9 @@ def compute_z(
     # rewrite layer, i.e. hypothesized fact lookup location, will induce the
     # target token to be predicted at the final layer.
     if hasattr(model.config, 'n_embd'):
-        delta = torch.zeros((model.config.n_embd,), requires_grad=True, device=f"cuda:{hparams.device}")
+        delta = torch.zeros((model.config.n_embd,), requires_grad=True, device=rewrite_device)
     elif hasattr(model.config, 'hidden_size'):
-        delta = torch.zeros((model.config.hidden_size,), requires_grad=True, device=f"cuda:{hparams.device}")
+        delta = torch.zeros((model.config.hidden_size,), requires_grad=True, device=rewrite_device)
     else:
         raise NotImplementedError
     target_init, kl_distr_init = None, None
@@ -91,28 +95,23 @@ def compute_z(
     def edit_output_fn(cur_out, cur_layer):
         nonlocal target_init
 
-        if cur_layer == hparams.layer_module_tmp.format(layer):
+        if cur_layer == rewrite_module_name:
+            hidden_state = nethook.get_hidden_state(cur_out)
+            delta_for_hidden = delta.to(device=hidden_state.device, dtype=hidden_state.dtype)
             # Store initial value of the vector of interest
             if target_init is None:
                 print("Recording initial value of v*")
                 # Initial value is recorded for the clean sentence
-                if isinstance(cur_out, tuple):
-                    target_init = cur_out[0][0, lookup_idxs[0]].detach().clone()
-                else:
-                    target_init = cur_out[0, lookup_idxs[0]].detach().clone()
+                target_init = hidden_state[0, lookup_idxs[0]].detach().clone()
 
             # Add intervened delta
             for i, idx in enumerate(lookup_idxs):
-                if isinstance(cur_out, tuple):
-                    if len(lookup_idxs)!=len(cur_out[0]):
-                        cur_out[0][idx, i, :] += delta
-                    else:
-                        cur_out[0][i, idx, :] += delta
+                if len(lookup_idxs)!=len(hidden_state):
+                    hidden_state[idx, i, :] += delta_for_hidden
                 else:
-                    if len(lookup_idxs)!=len(cur_out):
-                        cur_out[idx, i, :] += delta
-                    else:
-                        cur_out[i, idx, :] += delta
+                    hidden_state[i, idx, :] += delta_for_hidden
+
+            return nethook.replace_hidden_state(cur_out, hidden_state)
 
         return cur_out
 
@@ -150,15 +149,13 @@ def compute_z(
                 kl_distr_init = kl_log_probs.detach().clone()
 
         # Compute loss on rewriting targets
-        if isinstance(tr[hparams.layer_module_tmp.format(loss_layer)].output, tuple):
-            output=tr[hparams.layer_module_tmp.format(loss_layer)].output[0]
-        else:
-            output=tr[hparams.layer_module_tmp.format(loss_layer)].output
+        output = nethook.get_hidden_state(tr[hparams.layer_module_tmp.format(loss_layer)].output)
         if output.shape[1]!=rewriting_targets.shape[1]:
             output=torch.transpose(output, 0, 1)
         full_repr = output[:len(rewriting_prompts)]
 
-        log_probs = torch.log_softmax(ln_f(full_repr) @ lm_w.to(full_repr.device) + lm_b.to(full_repr.device), dim=2)
+        full_repr = ln_f(full_repr)
+        log_probs = torch.log_softmax(full_repr @ lm_w.to(full_repr.device) + lm_b.to(full_repr.device), dim=2)
         loss = torch.gather(
             log_probs,
             2,
@@ -198,7 +195,7 @@ def compute_z(
             with torch.no_grad():
                 delta[...] = delta * max_norm / delta.norm()
 
-    target = target_init + delta
+    target = target_init + delta.to(device=target_init.device, dtype=target_init.dtype)
     print(
         f"Init norm {target_init.norm()} | Delta norm {delta.norm()} | Target norm {target.norm()}"
     )

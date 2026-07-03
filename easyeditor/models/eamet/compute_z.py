@@ -4,9 +4,9 @@ import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from rome import repr_tools
-from util import nethook
-from random_word import RandomWords
+from ..rome import repr_tools
+from ...util import nethook
+from ...util.device import get_module_device, normalize_device
 import random
 import copy
 import time
@@ -14,6 +14,20 @@ from .hparams import EAMETHyperParams
 import torch.nn.functional as F
 
 # initial_sim_z = None
+
+def get_target_new_str(request: Dict) -> str:
+    target_new = request["target_new"]
+    if isinstance(target_new, dict):
+        return target_new["str"]
+    return target_new
+
+
+def set_target_new_str(request: Dict, value: str) -> None:
+    if isinstance(request["target_new"], dict):
+        request["target_new"]["str"] = value
+    else:
+        request["target_new"] = value
+
 
 def compute_z(
     model: AutoModelForCausalLM,
@@ -68,7 +82,10 @@ def compute_z(
     ### return_tensors="pt" gives [[xxx]].
     ##############################################################################
 
-    target_ids = tok(request["target_new"]["str"], return_tensors="pt").to("cuda")["input_ids"][0]
+    device = normalize_device(getattr(hparams, "device", None))
+    rewrite_module_name = hparams.layer_module_tmp.format(layer)
+    rewrite_device = get_module_device(nethook.get_module(model, rewrite_module_name), device)
+    target_ids = tok(get_target_new_str(request), return_tensors="pt").to(device)["input_ids"][0]
 
     print(f"DEBUG INFO:target_ids:{target_ids}")
     print(f"DEBUG INFO:tok('English'):{tok('English')}")
@@ -87,7 +104,7 @@ def compute_z(
         opt_target_ids = target_ids
     
     print(f"opt_target_ids:{opt_target_ids}")
-    tgt_str = request["target_new"]["str"]
+    tgt_str = get_target_new_str(request)
     ### tokenizer.decode([]) gives nothing
     
     if "llama-3.1" in str(model.config._name_or_path).lower():
@@ -124,9 +141,9 @@ def compute_z(
         all_filled_prompts,
         return_tensors="pt",
         padding=True,
-    ).to("cuda")
+    ).to(device)
 
-    rewriting_targets = torch.tensor(-100, device="cuda").repeat(
+    rewriting_targets = torch.tensor(-100, device=device).repeat(
         len(rewriting_prompts), *input_tok["input_ids"].shape[1:]
     )
     for i in range(len(rewriting_prompts)):
@@ -142,16 +159,18 @@ def compute_z(
     
     # Finalize rewrite and loss layers
     loss_layer = max(hparams.v_loss_layer, layer)
-    delta = torch.zeros((model.config.hidden_size, ), device="cuda", requires_grad=True)
+    delta = torch.zeros((model.config.hidden_size, ), device=rewrite_device, requires_grad=True)
     target_init, kl_distr_init, target_constrain = None, None, None
 
     ### nonlocal helps to modify parameter from outer function
     def edit_output_fn(cur_out, cur_layer):
         nonlocal target_init, target_constrain, delta
-        if cur_layer == hparams.layer_module_tmp.format(layer):
+        if cur_layer == rewrite_module_name:
+            hidden_state = nethook.get_hidden_state(cur_out)
+            delta_for_hidden = delta.to(device=hidden_state.device, dtype=hidden_state.dtype)
             if target_init is None:
                 print("Recording initial value of v*")
-                target_init = cur_out[0][0, lookup_idxs[0]].detach().clone()
+                target_init = hidden_state[0, lookup_idxs[0]].detach().clone()
                 print(f"DEBUG INFO:layer_ks_norm:{layer_ks_norm}")
 
                 if hparams.delta_init == "target_init":
@@ -173,7 +192,9 @@ def compute_z(
                     
             # Add intervened delta
             for i, idx in enumerate(lookup_idxs):
-                cur_out[0][i, idx, :] += delta
+                hidden_state[i, idx, :] += delta_for_hidden
+
+            return nethook.replace_hidden_state(cur_out, hidden_state)
 
         return cur_out
 
@@ -215,17 +236,18 @@ def compute_z(
                 kl_distr_init = kl_log_probs.detach().clone()
 
         # Compute loss on rewriting targets
-        full_repr = tr[hparams.layer_module_tmp.format(loss_layer)].output[0][
+        full_repr = nethook.get_hidden_state(tr[hparams.layer_module_tmp.format(loss_layer)].output)[
             : len(rewriting_prompts)
         ]
 
-        after_mult = ln_f(full_repr) @ lm_w + lm_b
+        full_repr = ln_f(full_repr)
+        after_mult = full_repr @ lm_w.to(full_repr.device) + lm_b.to(full_repr.device)
         log_probs = torch.log_softmax(after_mult, dim=2)
 
         loss = torch.gather(
             log_probs,
             2,
-            torch.where(rewriting_targets != -100, rewriting_targets, 0).unsqueeze(2),
+            torch.where(rewriting_targets != -100, rewriting_targets, 0).unsqueeze(2).to(log_probs.device),
         ).squeeze(2) # use gather to pick desired token from vocabulary
         mask = (rewriting_targets != -100).float()
 
@@ -250,7 +272,7 @@ def compute_z(
                 end_time = time.time()
                 print(f"time cost when compute cs structure:{end_time - start_time}")
 
-        nll_loss_each = -(loss * mask).sum(1) / opt_target_ids.size(0)
+        nll_loss_each = -(loss * mask.to(loss.device)).sum(1) / opt_target_ids.size(0)
         nll_loss = nll_loss_each.mean()
 
         kl_loss = hparams.kl_factor * torch.nn.functional.kl_div(
@@ -266,7 +288,17 @@ def compute_z(
         else:
             raise ValueError(f"weight_decay_method={hparams.weight_decay_method} not recognized")
 
-        loss = nll_loss + kl_loss + weight_decay + collision_loss + mse_loss
+        if torch.is_tensor(collision_loss):
+            collision_loss = collision_loss.to(nll_loss.device)
+        if torch.is_tensor(mse_loss):
+            mse_loss = mse_loss.to(nll_loss.device)
+        loss = (
+            nll_loss
+            + kl_loss.to(nll_loss.device)
+            + weight_decay.to(nll_loss.device)
+            + collision_loss
+            + mse_loss
+        )
 
         if loss < 1e-2 or it==0:
             if isinstance(collision_loss, int):
@@ -332,7 +364,7 @@ def compute_z(
             with torch.no_grad():
                 delta[...] = delta * max_norm / delta.norm()
  
-    target = target_init + delta    
+    target = target_init + delta.to(device=target_init.device, dtype=target_init.dtype)
     print(
         f"Init norm {target_init.norm()} | Delta norm {delta.norm()} | Target norm {target.norm()}"
     )
@@ -345,7 +377,6 @@ def noisy_trigger(
         num: int,
         tok: AutoTokenizer
 ) -> List[torch.Tensor]:
-    gen = RandomWords()
     trigers = tok([trigger], return_tensors="pt",
         padding=False)['input_ids'][0].tolist()
     noisy_list = []
@@ -366,7 +397,8 @@ def get_module_input_output_at_words(
     module_template: str,
     fact_token_strategy: str,
     minus = None,
-    change_padding = False
+    change_padding = False,
+    track = None,
 ) -> Tuple[torch.Tensor]:
     """
     Retrieves detached representations for a word at the input and
@@ -378,7 +410,6 @@ def get_module_input_output_at_words(
         tok=tok,
         layer=layer,
         module_template=module_template,
-        change_padding=change_padding
     )
     if "subject_" in fact_token_strategy and fact_token_strategy.index("subject_") == 0:
         context_info = dict(
@@ -386,8 +417,12 @@ def get_module_input_output_at_words(
             words=words,
         )
         subtoken = fact_token_strategy[len("subject_") :]
+        if track in {"in", "out"}:
+            return repr_tools.get_reprs_at_word_tokens(
+                track=track, subtoken=subtoken, **context_info, **word_repr_args
+            ).detach()
         l_input, l_output = repr_tools.get_reprs_at_word_tokens(
-            track="both", subtoken=subtoken, minus=minus, **context_info, **word_repr_args
+            track="both", subtoken=subtoken, **context_info, **word_repr_args
         )
     elif fact_token_strategy == "last":
         raise Exception("This is definitely bugged, fix it.")
@@ -430,7 +465,6 @@ def find_fact_lookup_idx(
             context_templates=[prompt],
             words=[subject],
             subtoken=fact_token_strategy[len("subject_") :],
-            model_name=model_name
         )[0][0]
     else:
         raise ValueError(f"fact_token={fact_token_strategy} not recognized")

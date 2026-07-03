@@ -2,6 +2,7 @@ from .ft import *
 from .ike import *
 from .kn import *
 from .memit import *
+from .memit_FE import *
 from .mend import *
 from .rome import *
 from .serac import *
@@ -16,6 +17,7 @@ from .qlora import *
 from .lora import *
 from .dpo import *
 from .alphaedit import *
+from .SPHERE import *
 from .deco import *
 from .dola import *
 from .deepedit_api import *

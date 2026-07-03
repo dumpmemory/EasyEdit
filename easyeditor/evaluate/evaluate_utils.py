@@ -13,6 +13,7 @@ from transformers import T5ForConditionalGeneration
 import time
 import regex
 import string
+from ..util.device import normalize_device
 
 
 def normalize_answer(s):
@@ -100,12 +101,11 @@ Just return the letters "A" or "B", with no text around it.
     time.sleep(1) # avoid high rate of request
     return llm_score
 
-def test_prediction_acc_LLM_judge(model, tok, hparams, prompts, targets, device, locality=False):
-    # generation & truncation
-    all_score = []
-    all_response = []
+def generate_texts(model, tok, hparams, prompts, device):
     if isinstance(prompts, str):
-        prompts, targets = [prompts, ], [targets, ]
+        prompts = [prompts]
+
+    all_response = []
     for prompt in prompts:
         messages = [
                 {"role": "system", "content": "You are a helpful assistant."},
@@ -121,7 +121,7 @@ def test_prediction_acc_LLM_judge(model, tok, hparams, prompts, targets, device,
             padding = True,
             truncation = True,
             return_tensors="pt",
-        ).to(f"cuda:{device}")
+        ).to(normalize_device(device))
         # add a template
         gen_tokens = model.generate(
             input_ids=prompt_tok['input_ids'],
@@ -145,25 +145,32 @@ def test_prediction_acc_LLM_judge(model, tok, hparams, prompts, targets, device,
         gen_content = tok.decode(trunc_gen_tokens)
         suffixes_to_remove = [".", "\n", tok.eos_token]
         for suffix in suffixes_to_remove:
-            if gen_content.endswith(suffix):
+            if suffix and gen_content.endswith(suffix):
                 gen_content = gen_content[:-len(suffix)]
-        # LLM-as-a-Judge
-        if hparams.evaluation_type == "generate-text":
-            all_response.append(gen_content)
-        elif hparams.evaluation_type == "LLM-judge" and hasattr(hparams, 'api_key') and hparams.api_key:
-            LLM_Score = llm_judge(prompts, targets, gen_content, hparams.api_key)
-            all_score.append(LLM_Score)
-            all_response.append(gen_content)
+
+        all_response.append(gen_content)
+
+    return all_response
+
+
+def test_prediction_acc_LLM_judge(model, tok, hparams, prompts, targets, device, locality=False):
+    if isinstance(prompts, str):
+        prompts = [prompts]
+    if isinstance(targets, str):
+        targets = [targets]
+    if len(prompts) != len(targets):
+        raise ValueError("The number of prompts and targets must match.")
+
+    all_response = generate_texts(model, tok, hparams, prompts, device)
+    all_score = []
+    for prompt, target, gen_content in zip(prompts, targets, all_response):
+        if hasattr(hparams, 'api_key') and hparams.api_key:
+            score = llm_judge(prompt, target, gen_content, hparams.api_key)
         else:
-            # the user do not provide api key, using exact match as an alternative
-            EM_Score = float(exact_match_score(gen_content, targets))
-            all_score.append(EM_Score)
-            all_response.append(gen_content)
-    
-    if len(all_score) > 0:
-        return all_score, all_response
-    else:
-        return all_response
+            score = float(exact_match_score(gen_content, target))
+        all_score.append(score)
+
+    return all_score, all_response
 
 def test_batch_prediction_acc(model, tok, hparams, prompts, target, device, locality=False):
     prompt_tok = tok(
@@ -172,7 +179,7 @@ def test_batch_prediction_acc(model, tok, hparams, prompts, target, device, loca
         truncation=True,
         max_length=hparams.max_length,
         return_tensors="pt",
-    ).to(f"cuda:{device}")
+    ).to(normalize_device(device))
 
     with torch.no_grad():
         outputs = model(**prompt_tok)
@@ -205,7 +212,7 @@ def test_seq2seq_batch_prediction_acc(model, tok, hparams, prompts, targets, dev
         truncation=True,
         max_length=hparams.max_length,
         return_tensors="pt",
-    ).to(f"cuda:{device}")
+    ).to(normalize_device(device))
 
     trg_tok = tok(
         targets,
@@ -213,7 +220,7 @@ def test_seq2seq_batch_prediction_acc(model, tok, hparams, prompts, targets, dev
         truncation=True,
         max_length=hparams.max_length,
         return_tensors="pt",
-    ).to(f"cuda:{device}")
+    ).to(normalize_device(device))
 
     prompt_tok['decoder_input_ids'] = trg_tok['input_ids']
     prompt_tok['decoder_attention_mask'] = trg_tok['attention_mask']
@@ -242,7 +249,7 @@ def test_prediction_acc(model, tok, hparams, prompts, targets, device, locality=
             prompt_tok = tok(
                 prompt,
                 return_tensors="pt",
-            ).to(f"cuda:{device}")
+            ).to(normalize_device(device))
             gen_token = model.generate(
                 input_ids=prompt_tok['input_ids'],
                 attention_mask=prompt_tok['attention_mask'],
@@ -274,7 +281,7 @@ def test_prediction_acc(model, tok, hparams, prompts, targets, device, locality=
         truncation=True,
         max_length=max(hparams.max_length, max_prompt_len),
         return_tensors="pt",
-    ).to(f"cuda:{device}")
+    ).to(normalize_device(device))
     prompt_tok = tok(
         prompts,
         padding=True,
@@ -677,7 +684,7 @@ def F1(model, tok, hparams, prompts, targets, device, locality=False, vanilla_ge
         truncation=True,
         max_length=max(hparams.max_length, max_prompt_len),
         return_tensors="pt",
-    ).to(f"cuda:{device}")
+    ).to(normalize_device(device))
     prompt_tok = tok(
         prompts,
         padding=True,
@@ -721,8 +728,8 @@ def test_instance_change(model, tok, max_length, prompts, targets, device, P = N
     )
     with torch.no_grad():
         pre_edit_outputs = model.generate(
-            input_ids=prompt_tok['input_ids'].to(f"cuda:{device}"),
-            attention_mask=prompt_tok['attention_mask'].to(f"cuda:{device}"),
+            input_ids=prompt_tok['input_ids'].to(normalize_device(device)),
+            attention_mask=prompt_tok['attention_mask'].to(normalize_device(device)),
             max_new_tokens=2,
             pad_token_id=tok.eos_token_id
         )
@@ -754,8 +761,8 @@ def test_concept_gen(model, tok, max_length, prompts, targets, device):
     )
     with torch.no_grad():
         pre_edit_outputs = model.generate(
-            input_ids=prompt_tok['input_ids'].to(f"cuda:{device}"),
-            attention_mask=prompt_tok['attention_mask'].to(f"cuda:{device}"),
+            input_ids=prompt_tok['input_ids'].to(normalize_device(device)),
+            attention_mask=prompt_tok['attention_mask'].to(normalize_device(device)),
             max_new_tokens=40,
             pad_token_id=tok.eos_token_id
         )
@@ -777,7 +784,7 @@ def test_safety_gen(
     if max_tokens < 1624:
         only_response = []
         for item in test_prompt:
-            input = tokenizer([item,], return_tensors="pt", padding=True, truncation=True).to(f"cuda:{cuda}")
+            input = tokenizer([item,], return_tensors="pt", padding=True, truncation=True).to(normalize_device(cuda))
             if input["input_ids"].size(-1) > max_tokens-max_output_tokens:
                 input = {k: v[:, -(max_tokens - max_output_tokens):] for k, v in input.items()}
             with torch.no_grad():
@@ -792,7 +799,7 @@ def test_safety_gen(
             only_response.append(texts[len(overlap)+1:].lstrip())
         return only_response
     else:
-        input = tokenizer(test_prompt, return_tensors="pt", padding=True, truncation=True).to(f"cuda:{cuda}")
+        input = tokenizer(test_prompt, return_tensors="pt", padding=True, truncation=True).to(normalize_device(cuda))
         with torch.no_grad():
             outputs = model.generate(**input, max_new_tokens=max_output_tokens)
             texts = [tokenizer.decode(output, skip_special_tokens=True) for output in outputs]

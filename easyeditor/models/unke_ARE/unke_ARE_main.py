@@ -5,6 +5,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from .compute_z import compute_z
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from ...util import nethook
+from ...util.device import get_model_device
 import torch.optim as optim
 
 import argparse
@@ -21,7 +22,8 @@ def compute_ks(
     layer: int,
     idxs_dict:dict,
 ):
-    input_ids = tok(batch_data, padding=True,return_tensors="pt").to("cuda")
+    device = get_model_device(model, fallback=getattr(hparams, "device", None))
+    input_ids = tok(batch_data, padding=True,return_tensors="pt").to(device)
     zs_out_dict = {}
 
     with torch.no_grad():
@@ -36,7 +38,7 @@ def compute_ks(
                 _ = model(**input_ids)
                 #layer_in_ks = tr.input #(bs:seq:h_dim)
                 zs_out = tr.output#(bs:seq:h_dim)
-    zs_out = zs_out[0] if type(zs_out) is tuple else zs_out
+    zs_out = nethook.get_hidden_state(zs_out)
     for k, idxs in idxs_dict.items():
         zs_out_list = []
         for idx in idxs:
@@ -119,14 +121,17 @@ def apply_unke_ARE_to_model(
                 _ = model(**contexts_tok)
                 layer_in_ks = tr.input #(bs:seq:h_dim)
                 layer_out_ks = tr.output#(bs:seq:h_dim)
-        layer_out_ks = layer_out_ks[0] if type(layer_out_ks) is tuple else layer_out_ks
+        layer_out_ks = nethook.get_hidden_state(layer_out_ks)
         
 
         cur_zs_dict = compute_ks(model, tok,batch_question_ans, hparams, z_layer, idxs_dict)
         targets_dict = {}
         for k, cur_zs_list in cur_zs_dict.items():
             zs_list = zs_dict[k]
-            targets_list = [(a - b)/(len(hparams.layers) - i) for a, b in zip(zs_list, cur_zs_list)]
+            targets_list = [
+                (a - b.to(device=a.device, dtype=a.dtype))/(len(hparams.layers) - i)
+                for a, b in zip(zs_list, cur_zs_list)
+            ]
             targets_dict[k] = targets_list
 
         ex_tok = tok(ex_data, padding=True, return_tensors="pt").to(
@@ -145,7 +150,7 @@ def apply_unke_ARE_to_model(
                 _ = model(**ex_tok)
                 stat_in = tr.input
                 stat_out = tr.output
-        stat_out = stat_out[0] if type(stat_out) is tuple else stat_out
+        stat_out = nethook.get_hidden_state(stat_out)
 
 
 
@@ -168,7 +173,7 @@ def apply_unke_ARE_to_model(
         for k, idxs_list in idxs_dict.items():
             for j, idx in enumerate(idxs_list):
                 resid = targets_dict[k][j]
-                layer_out_ks[k,idx]+=resid
+                layer_out_ks[k,idx]+=resid.to(device=layer_out_ks.device, dtype=layer_out_ks.dtype)
         
         # get_qwen2_causal_mask
         # llama2
@@ -184,7 +189,9 @@ def apply_unke_ARE_to_model(
             #scheduler.step()
             optimizer.zero_grad()
             if 'Qwen2.5-7B-Instruct' in hparams.model_name:
-                loss = criterion(_layer(stat_in,attention_mask=ex_causal_mask,position_ids=ex_position_ids)[0], stat_out)+ criterion(_layer(layer_in_ks,attention_mask=input_causal_mask,position_ids=input_position_ids)[0], layer_out_ks)
+                ex_position_embeddings = model.model.rotary_emb(stat_in, ex_position_ids)
+                input_position_embeddings = model.model.rotary_emb(layer_in_ks, input_position_ids)
+                loss = criterion(_layer(stat_in,attention_mask=ex_causal_mask,position_ids=ex_position_ids,position_embeddings=ex_position_embeddings)[0], stat_out)+ criterion(_layer(layer_in_ks,attention_mask=input_causal_mask,position_ids=input_position_ids,position_embeddings=input_position_embeddings)[0], layer_out_ks)
                 # loss =  criterion(_layer(layer_in_ks,attention_mask=input_causal_mask,position_ids=input_position_ids)[0], layer_out_ks)
             elif 'Llama3-8B-Instruct' in hparams.model_name:
                 loss = criterion(_layer(stat_in,attention_mask=ex_causal_mask,position_ids=ex_position_ids,cache_position = ex_cache_position)[0], stat_out)+ criterion(_layer(layer_in_ks,attention_mask=input_causal_mask,position_ids=input_position_ids,cache_position=input_cache_position)[0], layer_out_ks)

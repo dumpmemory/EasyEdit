@@ -4,23 +4,24 @@ import numpy as np
 from torch.nn import functional as F
 # from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 from transformers.generation.utils import (
-    LogitsProcessorList, 
-    StoppingCriteriaList, 
-    GenerationConfig, 
+    LogitsProcessorList,
+    StoppingCriteriaList,
+    GenerationConfig,
     GenerateNonBeamOutput,
     GenerateDecoderOnlyOutput,
-    GreedySearchOutput,
+    GenerateEncoderDecoderOutput,
     GenerateOutput,
-    GreedySearchEncoderDecoderOutput,
-    GreedySearchDecoderOnlyOutput,
-    SampleDecoderOnlyOutput,
-    SampleEncoderDecoderOutput,
-    BeamSearchDecoderOnlyOutput,
-    BeamSearchEncoderDecoderOutput,
     GenerateBeamEncoderDecoderOutput,
-    GenerateBeamDecoderOnlyOutput
-    
+    GenerateBeamDecoderOnlyOutput,
 )
+
+GreedySearchDecoderOnlyOutput = GenerateDecoderOnlyOutput
+GreedySearchEncoderDecoderOutput = GenerateEncoderDecoderOutput
+SampleDecoderOnlyOutput = GenerateDecoderOnlyOutput
+SampleEncoderDecoderOutput = GenerateEncoderDecoderOutput
+BeamSearchDecoderOnlyOutput = GenerateBeamDecoderOnlyOutput
+BeamSearchEncoderDecoderOutput = GenerateBeamEncoderDecoderOutput
+GreedySearchOutput = GenerateNonBeamOutput
 # from transformers.generation.streamers import BaseStreamer
 # from transformers.modeling_utils import PreTrainedModel
 # from transformers.utils import logging
@@ -39,7 +40,11 @@ from torch import nn
 from transformers.cache_utils import StaticCache
 from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 from transformers.utils import ModelOutput, logging
-from transformers.generation.beam_search import BeamScorer, BeamSearchScorer
+try:
+    from transformers.generation.beam_search import BeamScorer, BeamSearchScorer
+except ModuleNotFoundError:
+    BeamScorer = object
+    BeamSearchScorer = None
 from transformers.generation.configuration_utils import GenerationConfig, GenerationMode
 from transformers.generation.logits_process import (
     LogitsProcessorList,
@@ -168,7 +173,8 @@ def generate(
                 - [`~generation.GenerateBeamEncoderDecoderOutput`]
     """
     # 1. Handle `generation_config` and kwargs that might update it, and validate the `.generate()` call
-    self._validate_model_class()
+    if hasattr(self, "_validate_model_class"):
+        self._validate_model_class()
     generation_config, model_kwargs = self._prepare_generation_config(generation_config, **kwargs)
     self._validate_model_kwargs(model_kwargs.copy())
 
@@ -306,6 +312,13 @@ def generate(
             UserWarning,
         )
 
+    if hasattr(self, "_prepare_special_tokens"):
+        self._prepare_special_tokens(
+            generation_config,
+            kwargs_has_attention_mask=model_kwargs.get("attention_mask") is not None,
+            device=input_ids.device,
+        )
+
     # 8. prepare distribution pre_processing samplers
     prepared_logits_processor = self._get_logits_processor(
         generation_config=generation_config,
@@ -365,9 +378,7 @@ def generate(
         output_attentions = (
             output_attentions if output_attentions is not None else self.generation_config.output_attentions
         )
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.generation_config.output_hidden_states
-        )
+        output_hidden_states = True if output_hidden_states is None else output_hidden_states
         return_dict_in_generate = (
             return_dict_in_generate
             if return_dict_in_generate is not None
@@ -404,6 +415,8 @@ def generate(
 
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+            for key in ["return_dict", "output_attentions", "output_hidden_states"]:
+                model_inputs.pop(key, None)
 
             
             outputs = self(
@@ -579,9 +592,7 @@ def generate(
         output_attentions = (
             output_attentions if output_attentions is not None else self.generation_config.output_attentions
         )
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.generation_config.output_hidden_states
-        )
+        output_hidden_states = True if output_hidden_states is None else output_hidden_states
         return_dict_in_generate = (
             return_dict_in_generate
             if return_dict_in_generate is not None
@@ -620,6 +631,8 @@ def generate(
 
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+            for key in ["return_dict", "output_attentions", "output_hidden_states"]:
+                model_inputs.pop(key, None)
 
             outputs = self(
                 **model_inputs,
@@ -820,9 +833,7 @@ def generate(
         output_attentions = (
             output_attentions if output_attentions is not None else self.generation_config.output_attentions
         )
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.generation_config.output_hidden_states
-        )
+        output_hidden_states = True if output_hidden_states is None else output_hidden_states
         return_dict_in_generate = (
             return_dict_in_generate
             if return_dict_in_generate is not None
@@ -871,6 +882,8 @@ def generate(
 
         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+            for key in ["return_dict", "output_attentions", "output_hidden_states"]:
+                model_inputs.pop(key, None)
 
             # if sequential is True, split the input to batches of batch_size and run sequentially
             if sequential:
@@ -1135,6 +1148,11 @@ def generate(
             **model_kwargs,
         )
     elif generation_mode == GenerationMode.BEAM_SEARCH:
+        if BeamSearchScorer is None:
+            raise ImportError(
+                "DECO beam search requires transformers.generation.beam_search, "
+                "which is not available in Transformers 5.x."
+            )
         beam_scorer = BeamSearchScorer(
                 batch_size=batch_size,
                 num_beams=generation_config.num_beams,

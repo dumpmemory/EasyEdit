@@ -39,6 +39,7 @@ def euc(query, key, config, act_mask=None, infer=False):
         return topk.values.mean()
 
     if act_mask is not None:
+        act_mask = act_mask.to(device=l2_norm.device, dtype=l2_norm.dtype)
         return torch.sum(l2_norm * act_mask, dim=1) / torch.sum(act_mask, dim=1)
     else:
         return torch.mean(l2_norm, dim=-1)
@@ -77,7 +78,7 @@ class WISE(torch.nn.Module):
         adapter_layer = getattr(self.edit_module, self.layer_name)
 
         # if the condition below is True, then it is single-edit
-        if not config.sequential_edit:
+        if not getattr(config, "sequential_edit", False):
         # if type(adapter_layer) is not WISEAdapter:
             # 如果 adapter_layer 已经是 WISEAdapter，提取其原始层
             if type(adapter_layer) is WISEAdapter:
@@ -129,7 +130,7 @@ class WISE(torch.nn.Module):
     def get_adapter_layer(self):
         adapter_layer = getattr(self.edit_module, self.layer_name)
         assert type(adapter_layer) is WISEAdapter, print('Adapter Layer is not added correctly....')
-        return adapter_layer.to(self.model.device)
+        return adapter_layer
 
     # TODO: generation
     def generate(self, *args, **kwargs):
@@ -503,7 +504,7 @@ class WISEAdapter(torch.nn.Module):
         p_size = self.new_weight.grad.size()
         p_grad = self.new_weight.grad.reshape(-1)
 
-        # mask = torch.from_numpy(np.random.choice([0, 1], size=p_grad.size()[0], p=[.1, .9])).cuda()
+        # mask = torch.from_numpy(np.random.choice([0, 1], size=p_grad.size()[0], p=[.1, .9])).to(p_grad.device)
         p_grad = p_grad * self.weight_mask
         self.new_weight.grad = p_grad.view(p_size).to(self.new_weight.grad.dtype)
 

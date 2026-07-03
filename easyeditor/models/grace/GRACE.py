@@ -6,11 +6,15 @@ import transformers
 import os
 os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 
+def cdist_float32(key, query):
+    return torch.cdist(key.float(), query.float(), p=2)
+
+
 def euc(query, key):
     # Euclidean distance
     if len(key.shape) < 2:
         key = key.view(1, -1)
-    return torch.cdist(key, query, p=2)
+    return cdist_float32(key, query)
 
 def perturb_values(chosen_value, num_pert, device):
     # Create a bunch of noised versions of the value, then create batch, then train value
@@ -49,6 +53,7 @@ class GRACE(torch.nn.Module):
         edit_module = parent_module(self.model, brackets_to_periods(self.layer))
         layer_name = self.layer.rsplit(".", 1)[-1]
         original_layer = getattr(edit_module, layer_name)
+        self.device = original_layer.weight.device
         if type(original_layer) is not GRACEAdapter:
             setattr(edit_module, layer_name, GRACEAdapter(config, original_layer, transpose=transpose).to(self.device))
             self.original_layer = copy.deepcopy(original_layer)
@@ -206,7 +211,7 @@ class GRACEAdapter(torch.nn.Module):
                 # Keys exist, so we have decide whether or not to update them (the fact that we've made it to this point means there was an error!)
 
                 # --- search through keys for a match for query ---
-                dists = torch.cdist(self.keys, query, p=2).view(-1, len(query))
+                dists = cdist_float32(self.keys, query).view(-1, len(query))
                 smallest_distance, nearest_key = dists.min(0)
 
                 if smallest_distance > (self.init_epsilon + self.epsilons[nearest_key]):
@@ -233,7 +238,7 @@ class GRACEAdapter(torch.nn.Module):
         # print(token_to_edit)
         # compute distance from query to all keys and find the closest keys
 
-        dists = torch.cdist(self.keys, query, p=2).view(-1, len(query))
+        dists = cdist_float32(self.keys, query).view(-1, len(query))
         if dists.nelement() == 0:
             return layer_out
         smallest_dist, self.chosen_key = dists.min(0)
