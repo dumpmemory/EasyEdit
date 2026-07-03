@@ -20,7 +20,8 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers import LlamaTokenizer, LlamaForCausalLM
 from transformers import T5ForConditionalGeneration, T5Tokenizer
 from transformers import GPT2TokenizerFast, GPT2Tokenizer
-from transformers import AutoProcessor, LlavaOnevisionForConditionalGeneration, Qwen2VLForConditionalGeneration
+from transformers import AutoProcessor, LlavaOnevisionForConditionalGeneration
+from ..util.vl_utils import get_qwen_vl_model_class, is_hf_multimodal_model, is_qwen_vl_model, qwen_vl_model_family
 
 from ..util.globals import *
 from .batch_editor import BatchEditor
@@ -36,6 +37,7 @@ from ..util import nethook
 from ..util.hparams import HyperParams
 from ..util.alg_dict import *
 from ..util.device import copy_to_param, normalize_device
+from ..util.vl_utils import topk_token_match
 
 logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt = '%m/%d/%Y %H:%M:%S',
@@ -49,6 +51,89 @@ def make_logs():
     f_h, s_h = get_handler("logs/", log_name='run.log')
     LOG.addHandler(f_h)
     LOG.addHandler(s_h)
+
+
+def get_aligned_topk_token_ids(pre_logits, post_logits, k):
+    pre_logits = torch.as_tensor(pre_logits)
+    post_logits = torch.as_tensor(post_logits)
+    if pre_logits.dim() != 3 or post_logits.dim() != 3:
+        raise ValueError(
+            "pre_logits and post_logits must be rank-3 tensors shaped "
+            "[batch, sequence, vocab]."
+        )
+    if pre_logits.shape[0] != post_logits.shape[0]:
+        raise ValueError(
+            "pre_logits and post_logits must have the same batch size: "
+            f"{pre_logits.shape[0]} != {post_logits.shape[0]}"
+        )
+
+    if post_logits.shape[1] > pre_logits.shape[1]:
+        post_logits = post_logits[:, -pre_logits.shape[1]:, :]
+    else:
+        pre_logits = pre_logits[:, -post_logits.shape[1]:, :]
+
+    k = min(k, pre_logits.shape[-1], post_logits.shape[-1])
+    pre_topk = torch.topk(pre_logits, k=k, dim=-1).indices.cpu().tolist()
+    post_topk = torch.topk(post_logits, k=k, dim=-1).indices.cpu().tolist()
+    return pre_topk, post_topk
+
+
+def attach_topk_locality_metrics(metrics):
+    if 'locality_output' in metrics['post'].keys():
+        assert len(metrics['post']['locality_output']) == \
+                len(metrics['pre']['locality_output'])
+        pre_topk, post_topk = get_aligned_topk_token_ids(
+            metrics['pre']['locality_output'],
+            metrics['post']['locality_output'],
+            k=1,
+        )
+        metrics['pre']['locality_topk_tokens'] = pre_topk
+        metrics['post']['locality_topk_tokens'] = post_topk
+        metrics['post']['locality_acc'] = topk_token_match(
+            metrics['pre']['locality_output'],
+            metrics['post']['locality_output'],
+            k=1,
+        )
+        attach_metric_meta(
+            metrics['post'],
+            "locality.text",
+            build_multimodal_locality_metric_meta(
+                result_key="locality_acc",
+                protocol="pre_post_top1_token_match",
+                scorer="top1_token_match",
+                comparable_group="locality.multimodal.pre_post_top1_token_match",
+            ),
+        )
+        metrics['post'].pop('locality_output')
+        metrics['pre'].pop('locality_output')
+
+    if 'multimodal_locality_output' in metrics['post'].keys():
+        assert len(metrics['post']['multimodal_locality_output']) == \
+                len(metrics['pre']['multimodal_locality_output'])
+        pre_topk, post_topk = get_aligned_topk_token_ids(
+            metrics['pre']['multimodal_locality_output'],
+            metrics['post']['multimodal_locality_output'],
+            k=10,
+        )
+        metrics['pre']['multimodal_locality_topk_tokens'] = pre_topk
+        metrics['post']['multimodal_locality_topk_tokens'] = post_topk
+        metrics['post']['multimodal_locality_acc'] = topk_token_match(
+            metrics['pre']['multimodal_locality_output'],
+            metrics['post']['multimodal_locality_output'],
+            k=10,
+        )
+        attach_metric_meta(
+            metrics['post'],
+            "locality.image",
+            build_multimodal_locality_metric_meta(
+                result_key="multimodal_locality_acc",
+                protocol="pre_post_top10_token_match",
+                scorer="top10_token_match",
+                comparable_group="locality.multimodal.pre_post_top10_token_match",
+            ),
+        )
+        metrics['post'].pop('multimodal_locality_output')
+        metrics['pre'].pop('multimodal_locality_output')
 
 
 class MultimodalEditor:
@@ -153,17 +238,18 @@ class MultimodalEditor:
                 self.tok = AutoProcessor.from_pretrained(hparams.model_name)
                 self.model_name = "llava-onevision"
 
-            elif "qwen2-vl" in hparams.model_name.lower():
+            elif is_qwen_vl_model(hparams.model_name):
                 if not hasattr(hparams, 'dtype'):
                     hparams.dtype = torch.float32
-                self.model = Qwen2VLForConditionalGeneration.from_pretrained(
-                    hparams.model_name, 
+                ModelClass = get_qwen_vl_model_class(hparams.model_name)
+                self.model = ModelClass.from_pretrained(
+                    hparams.model_name,
                     torch_dtype=hparams.dtype,
                     # attn_implementation="flash_attention_2"
                 )
                 self.vis_tok = Qwen2VLProcessor()
                 self.tok = AutoProcessor.from_pretrained(hparams.model_name)
-                self.model_name = "qwen2-vl"
+                self.model_name = qwen_vl_model_family(hparams.model_name)
                 
         else:
             self.model, self.tok = self.model_name
@@ -227,7 +313,7 @@ class MultimodalEditor:
                     if self.model_name in ['minigpt4', 'blip2']:
                         pre_result = compute_multimodal_edit_results(self.model, self.model_name, self.hparams, self.tok,
                                                                 request, self.hparams.device)
-                    elif self.model_name in ['llava-onevision', 'qwen2-vl']:
+                    elif is_hf_multimodal_model(self.model_name):
                         pre_result = compute_multimodal_hf_edit_results(self.model, self.model_name, self.hparams, self.tok,
                                                                 request, self.hparams.device)
                 pre_edit_cache.append(pre_result)
@@ -238,6 +324,21 @@ class MultimodalEditor:
                 if self.alg_name == 'IKE' and self.hparams.k == 0:
                     edited_model = self.model
                     weights_copy = None
+                elif self.alg_name == 'IKE':
+                    if 'train_ds' not in kwargs:
+                        raise ValueError("IKE editing requires train_ds for in-context prompt construction.")
+                    edited_model = self.model
+                    weights_copy = {}
+                    icl_examples = self.apply_algo(
+                        self.model,
+                        self.tok,
+                        request,
+                        self.hparams,
+                        copy=False,
+                        return_orig_weights=True,
+                        keep_original_weight=keep_original_weight,
+                        train_ds=kwargs['train_ds']
+                    )
                 else:
                     edited_model, weights_copy = self.apply_algo(
                         self.model,
@@ -283,7 +384,7 @@ class MultimodalEditor:
                                                                 request, self.hparams.device),
                             "pre": pre_edit_cache[i]
                         }
-                    elif self.model_name in ['llava-onevision', 'qwen2-vl']:
+                    elif is_hf_multimodal_model(self.model_name):
                         metrics = {
                             'case_nums': i,
                             "time": exec_time,
@@ -292,43 +393,7 @@ class MultimodalEditor:
                             "pre": pre_edit_cache[i]
                         }
                                 
-                if 'locality_output' in metrics['post'].keys():
-                    assert len(metrics['post']['locality_output']) == \
-                            len(metrics['pre']['locality_output'])
-                    base_logits = torch.tensor(metrics['pre']['locality_output']).to(torch.float32)
-                    post_logits = torch.tensor(metrics['post']['locality_output']).to(torch.float32)
-                    metrics['post']['locality_acc'] = sum(post_logits.view(-1) == base_logits.view(-1))/base_logits.view(-1).shape[0]
-                    attach_metric_meta(
-                        metrics['post'],
-                        "locality.text",
-                        build_multimodal_locality_metric_meta(
-                            result_key="locality_acc",
-                            protocol="pre_post_full_logits_exact_match",
-                            scorer="logits_exact_match",
-                            comparable_group="locality.multimodal.full_logits_exact_match",
-                        ),
-                    )
-                    metrics['post'].pop('locality_output')
-                    metrics['pre'].pop('locality_output')
-                    
-                if 'multimodal_locality_output' in metrics['post'].keys():
-                    assert len(metrics['post']['multimodal_locality_output']) == \
-                            len(metrics['pre']['multimodal_locality_output'])
-                    base_image_logits = torch.tensor(metrics['pre']['multimodal_locality_output']).to(torch.float32)
-                    post_image_logits = torch.tensor(metrics['post']['multimodal_locality_output']).to(torch.float32)
-                    metrics['post']['multimodal_locality_acc'] = sum(post_image_logits.view(-1) == base_image_logits.view(-1))/post_image_logits.view(-1).shape[0]
-                    attach_metric_meta(
-                        metrics['post'],
-                        "locality.image",
-                        build_multimodal_locality_metric_meta(
-                            result_key="multimodal_locality_acc",
-                            protocol="pre_post_full_logits_exact_match",
-                            scorer="logits_exact_match",
-                            comparable_group="locality.multimodal.full_logits_exact_match",
-                        ),
-                    )
-                    metrics['post'].pop('multimodal_locality_output')
-                    metrics['pre'].pop('multimodal_locality_output')
+                attach_topk_locality_metrics(metrics)
 
                 LOG.info(f"Evaluation took {time() - start}")
                 all_metrics.append(metrics)
@@ -344,7 +409,8 @@ class MultimodalEditor:
                 start = time()
                 if self.alg_name == 'IKE':
                     if self.hparams.k != 0:                    
-                        assert 'train_ds' in kwargs.keys(), 'IKE need train_ds (For getting In-Context prompt)'
+                        if 'train_ds' not in kwargs:
+                            raise ValueError("IKE editing requires train_ds for in-context prompt construction.")
                         edited_model, weights_copy, icl_examples = self.model, {}, self.apply_algo(
                             self.model,
                             self.tok,
@@ -408,7 +474,7 @@ class MultimodalEditor:
                             "pre": compute_multimodal_edit_results(self.model, self.model_name, self.hparams, self.tok,
                                                                 request, self.hparams.device)
                         }
-                    elif self.model_name in ['llava-onevision', 'qwen2-vl']:
+                    elif is_hf_multimodal_model(self.model_name):
                         metrics = {
                             'case_id': i,
                             # "requested_rewrite": request,
@@ -420,43 +486,7 @@ class MultimodalEditor:
                         }   
                      
                     
-                if 'locality_output' in metrics['post'].keys():
-                    assert len(metrics['post']['locality_output']) == \
-                            len(metrics['pre']['locality_output'])
-                    base_logits = torch.tensor(metrics['pre']['locality_output']).to(torch.float32)
-                    post_logits = torch.tensor(metrics['post']['locality_output']).to(torch.float32)
-                    metrics['post']['locality_acc'] = sum(post_logits.view(-1) == base_logits.view(-1))/base_logits.view(-1).shape[0]
-                    attach_metric_meta(
-                        metrics['post'],
-                        "locality.text",
-                        build_multimodal_locality_metric_meta(
-                            result_key="locality_acc",
-                            protocol="pre_post_full_logits_exact_match",
-                            scorer="logits_exact_match",
-                            comparable_group="locality.multimodal.full_logits_exact_match",
-                        ),
-                    )
-                    metrics['post'].pop('locality_output')
-                    metrics['pre'].pop('locality_output')
-                    
-                if 'multimodal_locality_output' in metrics['post'].keys():
-                    assert len(metrics['post']['multimodal_locality_output']) == \
-                            len(metrics['pre']['multimodal_locality_output'])
-                    base_image_logits = torch.tensor(metrics['pre']['multimodal_locality_output']).to(torch.float32)
-                    post_image_logits = torch.tensor(metrics['post']['multimodal_locality_output']).to(torch.float32)
-                    metrics['post']['multimodal_locality_acc'] = sum(post_image_logits.view(-1) == base_image_logits.view(-1))/post_image_logits.view(-1).shape[0]
-                    attach_metric_meta(
-                        metrics['post'],
-                        "locality.image",
-                        build_multimodal_locality_metric_meta(
-                            result_key="multimodal_locality_acc",
-                            protocol="pre_post_full_logits_exact_match",
-                            scorer="logits_exact_match",
-                            comparable_group="locality.multimodal.full_logits_exact_match",
-                        ),
-                    )
-                    metrics['post'].pop('multimodal_locality_output')
-                    metrics['pre'].pop('multimodal_locality_output')
+                attach_topk_locality_metrics(metrics)
 
 
                 LOG.info(f"Evaluation took {time() - start}")
@@ -513,7 +543,7 @@ class MultimodalEditor:
                 if self.model_name in ['minigpt4', 'blip2']:
                     pre_res = compute_multimodal_edit_results(self.model, self.model_name, self.hparams, self.tok,
                                                             request, self.hparams.device)
-                elif self.model_name in ['llava-onevision', 'qwen2-vl']:
+                elif is_hf_multimodal_model(self.model_name):
                     pre_res = compute_multimodal_hf_edit_results(self.model, self.model_name, self.hparams, self.tok,
                                                             request, self.hparams.device)
                 edited_model, weights_copy = self.apply_algo(
@@ -547,7 +577,7 @@ class MultimodalEditor:
                                                             request, self.hparams.device),
                         "pre": pre_res
                     }
-                elif self.model_name in ['llava-onevision', 'qwen2-vl']:
+                elif is_hf_multimodal_model(self.model_name):
                     metrics = {
                         'case_id': i,
                         # "requested_rewrite": request,
@@ -565,57 +595,7 @@ class MultimodalEditor:
                 #     "pre": compute_multimodal_edit_results(self.model, self.model_name, self.hparams, self.tok,
                 #                                         request, self.hparams.device)
                 # }
-            if 'locality_output' in metrics['post'].keys():
-                assert len(metrics['post']['locality_output']) == \
-                        len(metrics['pre']['locality_output'])
-                base_logits = metrics['pre']['locality_output'].to(torch.float32)
-                post_logits = metrics['post']['locality_output'].to(torch.float32)
-                if post_logits.shape[1] > base_logits.shape[1]:
-                    post_logits = post_logits[:, -base_logits.shape[1]:, :]
-                else:
-                    base_logits = base_logits[:, -post_logits.shape[1]:, :]
-
-                base_logits_softmax_top_k = torch.topk(torch.nn.functional.softmax(base_logits, dim=-1), k=1, dim=-1).indices
-                post_base_logits_softmax_top_k = torch.topk(torch.nn.functional.softmax(post_logits, dim=-1), k=1, dim=-1).indices
-                metrics['post']['locality_acc'] = sum(post_base_logits_softmax_top_k.view(-1) == base_logits_softmax_top_k.view(-1))/post_base_logits_softmax_top_k.view(-1).shape[0]
-                attach_metric_meta(
-                    metrics['post'],
-                    "locality.text",
-                    build_multimodal_locality_metric_meta(
-                        result_key="locality_acc",
-                        protocol="pre_post_top1_token_match",
-                        scorer="top1_token_match",
-                        comparable_group="locality.multimodal.pre_post_top1_token_match",
-                    ),
-                )
-                metrics['post'].pop('locality_output')
-                metrics['pre'].pop('locality_output')
-                
-            if 'multimodal_locality_output' in metrics['post'].keys():
-                assert len(metrics['post']['multimodal_locality_output']) == \
-                        len(metrics['pre']['multimodal_locality_output'])
-                base_image_logits = metrics['pre']['multimodal_locality_output'].to(torch.float32)
-                post_image_logits = metrics['post']['multimodal_locality_output'].to(torch.float32)
-                if post_image_logits.shape[1] > base_image_logits.shape[1]:
-                    post_image_logits = post_image_logits[:, -base_image_logits.shape[1]:, :]
-                else:
-                    base_image_logits = base_image_logits[:, -post_image_logits.shape[1]:, :]
-
-                base_image_logits_softmax_top_k = torch.topk(torch.nn.functional.softmax(base_image_logits, dim=-1), k=10, dim=-1).indices
-                post_image_base_logits_softmax_top_k = torch.topk(torch.nn.functional.softmax(post_image_logits, dim=-1), k=10, dim=-1).indices
-                metrics['post']['multimodal_locality_acc'] = sum(post_image_base_logits_softmax_top_k.view(-1) == base_image_logits_softmax_top_k.view(-1))/post_image_base_logits_softmax_top_k.view(-1).shape[0]
-                attach_metric_meta(
-                    metrics['post'],
-                    "locality.image",
-                    build_multimodal_locality_metric_meta(
-                        result_key="multimodal_locality_acc",
-                        protocol="pre_post_top10_token_match",
-                        scorer="top10_token_match",
-                        comparable_group="locality.multimodal.pre_post_top10_token_match",
-                    ),
-                )
-                metrics['post'].pop('multimodal_locality_output')
-                metrics['pre'].pop('multimodal_locality_output')
+            attach_topk_locality_metrics(metrics)
 
             LOG.info(f"Evaluation took {time() - start}")
 
@@ -702,7 +682,7 @@ class MultimodalEditor:
                 locality_prompts = [locality_prompts, ]
             if isinstance(locality_ground_truth, str):
                 locality_ground_truth = [locality_ground_truth, ]
-            assert len(locality_inputs['text']['prompt']) == len(locality_inputs['text']['ground_truth']) \
+            assert len(locality_prompts) == len(locality_ground_truth) \
                 == len(requests) or print('One Edit instance needs one locality input.....')
         if "vision" in locality_inputs.keys():
             multimodal_locality_prompts = locality_inputs['vision']['prompt']
@@ -714,8 +694,10 @@ class MultimodalEditor:
                 multimodal_locality_ground_truth = [multimodal_locality_ground_truth, ]
             if isinstance(multimodal_locality_image, str):
                 multimodal_locality_image = [multimodal_locality_image, ]
-            assert len(locality_inputs['vision']['prompt']) == len(locality_inputs['vision']['ground_truth']) \
-                == len(locality_inputs['vision']['image']) == len(requests) or print('One Edit instance needs one locality input.....')
+            elif not isinstance(multimodal_locality_image, list):
+                multimodal_locality_image = [multimodal_locality_image, ]
+            assert len(multimodal_locality_prompts) == len(multimodal_locality_ground_truth) \
+                == len(multimodal_locality_image) == len(requests) or print('One Edit instance needs one locality input.....')
 
         if rephrase_prompts is not None:
             if isinstance(rephrase_prompts, str):
@@ -729,6 +711,8 @@ class MultimodalEditor:
                 )
         if rephrase_image is not None:
             if isinstance(rephrase_image, str):
+                rephrase_image = [rephrase_image, ]
+            elif not isinstance(rephrase_image, list):
                 rephrase_image = [rephrase_image, ]
             # rephrase_image_path = [os.path.join(self.rephrase_root, rephrase_image_) for rephrase_image_ in rephrase_image]
             # rephrase_image = [Image.open(ip).convert("RGB") for ip in rephrase_image_path]
