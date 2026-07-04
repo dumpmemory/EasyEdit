@@ -383,6 +383,11 @@ class BaseModelWrapper:
         if self.model is not None:
             self._adapt_model_layers()
 
+    @property
+    def torch_dtype(self):
+        """Backward-compatible alias for ``dtype`` used by legacy steer code."""
+        return self.dtype
+
     def _load_hf_model(self):
         return AutoModelForCausalLM.from_pretrained(
             self.model_name_or_path,
@@ -914,40 +919,3 @@ class GPTWrapper(BaseModelWrapper):
                 delattr(self, 'prompt')
         else:
             raise ValueError(f"Method {method_name} not supported to reset")
-    
-    def ori_generate(self, input_ids, **kwargs):
-        # Save activation dictionaries
-        saved_activations = {}
-        if hasattr(self.model, 'transformer') and isinstance(self.model.transformer, Hack_no_grad):
-            model_layers = self.model.transformer.module.h
-        else:
-            model_layers = self.model.transformer.h
-            
-        for i, layer in enumerate(model_layers):
-            if hasattr(layer, 'add_activations_dict') and layer.add_activations_dict:
-                saved_activations[i] = copy.deepcopy(layer.add_activations_dict)
-                layer.add_activations_dict = {}
-        
-        # Save steer value if exists
-        saved_steer_value = 0
-        if hasattr(self, 'steer') and hasattr(self.steer, 'steer_value'):
-            saved_steer_value = self.steer.steer_value
-            self.steer.steer_value = 0
-        
-        # Generate text
-        try:
-            output = self.model.generate(
-                input_ids=input_ids,
-                **kwargs
-            )
-        finally:
-            # Restore activation dictionaries
-            for i, activations_dict in saved_activations.items():
-                model_layers[i].add_activations_dict = activations_dict
-            
-            # Restore steer value
-            if saved_steer_value is not None and hasattr(self, 'steer'):
-                self.steer.steer_value = saved_steer_value
-        
-
-        return output
