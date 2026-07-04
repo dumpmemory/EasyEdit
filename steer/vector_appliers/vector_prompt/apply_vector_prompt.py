@@ -3,9 +3,13 @@ import json
 import torch
 from tqdm import tqdm
 from .apply_vector_prompt_hparam import ApplyVectorPromptHyperParams
+from ..vllm_activation_utils import reset_vllm_activation_layers, set_vllm_add_activations, uses_vllm
 
 
 def reset_vector_prompt_layers(model, layers):
+    if uses_vllm(model):
+        reset_vllm_activation_layers(model, "vector_prompt", layers)
+        return
     decoder_layers = model._decoder_layers()
     for layer in layers:
         decoder_layers[layer].reset(method_name="vector_prompt")
@@ -24,6 +28,7 @@ def apply_vector_prompt(hparams: ApplyVectorPromptHyperParams,pipline=None,vecto
     
     layers = hparams.layers
     multipliers = hparams.multipliers
+    vllm_layer_vectors = {}
     for layer, multiplier in zip(layers, multipliers):
         print(f"Layer {layer}")
         if vector is not None:
@@ -38,14 +43,15 @@ def apply_vector_prompt(hparams: ApplyVectorPromptHyperParams,pipline=None,vecto
         print("Steering vector: ",steering_vector)
         print(f"Multiplier {multiplier}")
 
-        from ...models.interventions import ActivationAddition
-
-        intervention = ActivationAddition(
-            steering_vector=steering_vector,
-            multiplier=multiplier,
-        )
-        intervention = intervention.to(device)
-        model.set_intervention(layer, intervention, "vector_prompt")
+        add_vector = multiplier * steering_vector
+        if uses_vllm(model):
+            vllm_layer_vectors[layer] = add_vector
+        else:
+            model.set_add_activations(
+                layer, add_vector, method_name="vector_prompt"
+            )
+    if uses_vllm(model):
+        set_vllm_add_activations(model, "vector_prompt", vllm_layer_vectors)
     return model
 
 # def eval_caa(hparams: ApplyCAAHyperParams):
