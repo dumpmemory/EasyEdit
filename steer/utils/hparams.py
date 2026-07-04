@@ -21,6 +21,10 @@ class HyperParams:
     # Updates for new vLLM kwargs; these are ignored by non-vLLM wrappers, so they can be set unconditionally.
     vllm_gpu_memory_utilization: float = 0.9
     vllm_max_model_len: Optional[int] = None
+    vllm_enable_v1_multiprocessing: bool = True
+    vllm_enforce_eager: bool = True
+    vllm_tensor_parallel_size: int = 1
+    vllm_pipeline_parallel_size: int = 1
     save_activations: bool = True
     enable_thinking: Optional[bool] = None
     @classmethod
