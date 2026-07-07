@@ -243,7 +243,7 @@ class GRACEAdapter(torch.nn.Module):
             return layer_out
         smallest_dist, self.chosen_key = dists.min(0)
         smallest_dist = smallest_dist.view(-1, 1)
-        chosen_value = self.values[self.chosen_key]
+        chosen_value = self.values[self.chosen_key].to(dtype=layer_out.dtype)
         eps = self.epsilons[self.chosen_key].view(-1, 1)
 
         if (self.config.val_train == "adv") and (self.training):
