@@ -79,6 +79,7 @@ We have also published a blog post titled "[Take Control of What Your LLM Knows 
 
 ## 🔔News
 - 2026-07-13, 🎉 EasyEdit has been selected for the CCF ODTC open source incentive program.
+- 2026-07-08, 🚀 EasyEdit has received a major upgrade, bringing Transformers 5.x compatibility, new models support, more reliable multi-GPU editing, enhanced multimodal pipelines, a unified EasyEdit2 steering workflow, expanded vLLM support, and faster multi-worker deployment.
 - 2026-03-04, 🎉 [SteerEval](https://github.com/zjunlp/EasyEdit/blob/main/examples/SteerEval.md) is released — a hierarchical benchmark for evaluating LLM controllability across behavioral domains and granularity levels, with an automated data synthesis pipeline.
 - 2025-10-12, ⚡ [LightMem](https://github.com/zjunlp/LightMem) is released — a lightweight and efficient memory framework empowering LLMs and AI agents with long-term memory capabilities!
 - 2025-10-02, 👑 [SimIE](https://openreview.net/pdf?id=VdEG08ZJCH) has arrived — a general framework for lifelong model editing, which restores the strong performance of parameter-modifying methods from standard model editing in a lifelong context!
